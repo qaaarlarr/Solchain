@@ -387,3 +387,305 @@
         )
     )
 )
+
+(define-constant min-reward-distribution u1000000)
+(define-constant max-reward-distributions u50)
+(define-constant reward-distribution-fee u5)
+
+(define-data-var total-rewards-distributed uint u0)
+(define-data-var reward-distribution-count uint u0)
+
+(define-map project-reward-pools
+    uint
+    {
+        total-deposited: uint,
+        total-distributed: uint,
+        distribution-count: uint,
+        last-distribution: uint,
+        active: bool
+    }
+)
+
+(define-map reward-distributions
+    { project-id: uint, distribution-id: uint }
+    {
+        amount: uint,
+        distribution-date: uint,
+        total-investors: uint,
+        claimed-amount: uint,
+        claimed-count: uint,
+        description: (string-ascii 100),
+        creator: principal
+    }
+)
+
+(define-map investor-reward-claims
+    { project-id: uint, distribution-id: uint, investor: principal }
+    {
+        amount: uint,
+        claimed: bool,
+        claim-date: (optional uint)
+    }
+)
+
+(define-map investor-total-rewards
+    principal
+    {
+        total-earned: uint,
+        total-claimed: uint,
+        projects-invested: uint,
+        last-claim: uint
+    }
+)
+
+(define-public (initialize-reward-pool (project-id uint))
+    (let ((project-data (unwrap! (map-get? projects project-id) (err u74))))
+        (asserts! (is-eq (get owner project-data) tx-sender) (err u75))
+        (asserts! (is-eq (get status project-data) "success") (err u76))
+        (asserts! (is-none (map-get? project-reward-pools project-id)) (err u77))
+        
+        (map-set project-reward-pools project-id {
+            total-deposited: u0,
+            total-distributed: u0,
+            distribution-count: u0,
+            last-distribution: u0,
+            active: true
+        })
+        (ok true)
+    )
+)
+
+(define-public (deposit-rewards (project-id uint) (amount uint) (description (string-ascii 100)))
+    (let (
+        (project-data (unwrap! (map-get? projects project-id) (err u78)))
+        (reward-pool (unwrap! (map-get? project-reward-pools project-id) (err u79)))
+        (distribution-id (get distribution-count reward-pool))
+    )
+        (asserts! (is-eq (get owner project-data) tx-sender) (err u80))
+        (asserts! (>= amount min-reward-distribution) (err u81))
+        (asserts! (get active reward-pool) (err u82))
+        (asserts! (< distribution-id max-reward-distributions) (err u83))
+        
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        
+        (map-set project-reward-pools project-id 
+            (merge reward-pool {
+                total-deposited: (+ (get total-deposited reward-pool) amount),
+                distribution-count: (+ distribution-id u1),
+                last-distribution: stacks-block-height
+            })
+        )
+        
+        (map-set reward-distributions 
+            {project-id: project-id, distribution-id: distribution-id}
+            {
+                amount: amount,
+                distribution-date: stacks-block-height,
+                total-investors: (get investors project-data),
+                claimed-amount: u0,
+                claimed-count: u0,
+                description: description,
+                creator: tx-sender
+            }
+        )
+        
+        (var-set reward-distribution-count (+ (var-get reward-distribution-count) u1))
+        (ok distribution-id)
+    )
+)
+
+(define-public (calculate-investor-reward (project-id uint) (distribution-id uint) (investor principal))
+    (let (
+        (project-data (unwrap! (map-get? projects project-id) (err u84)))
+        (distribution-data (unwrap! (map-get? reward-distributions {project-id: project-id, distribution-id: distribution-id}) (err u85)))
+        (investor-investment (default-to u0 (map-get? investments {project-id: project-id, investor: investor})))
+        (total-raised (get raised project-data))
+    )
+        (asserts! (> investor-investment u0) (err u86))
+        (asserts! (> total-raised u0) (err u87))
+        
+        (let (
+            (reward-amount (/ (* (get amount distribution-data) investor-investment) total-raised))
+            (fee-amount (/ (* reward-amount reward-distribution-fee) u100))
+            (net-reward (- reward-amount fee-amount))
+        )
+            (map-set investor-reward-claims
+                {project-id: project-id, distribution-id: distribution-id, investor: investor}
+                {
+                    amount: net-reward,
+                    claimed: false,
+                    claim-date: none
+                }
+            )
+            (ok net-reward)
+        )
+    )
+)
+
+(define-public (claim-reward (project-id uint) (distribution-id uint))
+    (let (
+        (reward-claim (unwrap! (map-get? investor-reward-claims {project-id: project-id, distribution-id: distribution-id, investor: tx-sender}) (err u88)))
+        (distribution-data (unwrap! (map-get? reward-distributions {project-id: project-id, distribution-id: distribution-id}) (err u89)))
+        (investor-stats (default-to 
+            {total-earned: u0, total-claimed: u0, projects-invested: u0, last-claim: u0}
+            (map-get? investor-total-rewards tx-sender)))
+    )
+        (asserts! (not (get claimed reward-claim)) (err u90))
+        (asserts! (> (get amount reward-claim) u0) (err u91))
+        
+        (try! (as-contract (stx-transfer? (get amount reward-claim) tx-sender tx-sender)))
+        
+        (map-set investor-reward-claims
+            {project-id: project-id, distribution-id: distribution-id, investor: tx-sender}
+            (merge reward-claim {
+                claimed: true,
+                claim-date: (some stacks-block-height)
+            })
+        )
+        
+        (map-set reward-distributions 
+            {project-id: project-id, distribution-id: distribution-id}
+            (merge distribution-data {
+                claimed-amount: (+ (get claimed-amount distribution-data) (get amount reward-claim)),
+                claimed-count: (+ (get claimed-count distribution-data) u1)
+            })
+        )
+        
+        (map-set investor-total-rewards tx-sender
+            (merge investor-stats {
+                total-earned: (+ (get total-earned investor-stats) (get amount reward-claim)),
+                total-claimed: (+ (get total-claimed investor-stats) (get amount reward-claim)),
+                last-claim: stacks-block-height
+            })
+        )
+        
+        (var-set total-rewards-distributed (+ (var-get total-rewards-distributed) (get amount reward-claim)))
+        (ok true)
+    )
+)
+
+(define-public (batch-calculate-rewards (project-id uint) (distribution-id uint) (investors (list 50 principal)))
+    (let (
+        (project-data (unwrap! (map-get? projects project-id) (err u92)))
+        (distribution-data (unwrap! (map-get? reward-distributions {project-id: project-id, distribution-id: distribution-id}) (err u93)))
+    )
+        (asserts! (is-eq (get creator distribution-data) tx-sender) (err u94))
+        
+        (ok (map calculate-single-reward 
+            (map create-investor-tuple investors)
+        ))
+    )
+)
+
+(define-private (create-investor-tuple (investor principal))
+    {investor: investor, project-id: u0, distribution-id: u0}
+)
+
+(define-private (calculate-single-reward (investor-data {investor: principal, project-id: uint, distribution-id: uint}))
+    (calculate-investor-reward 
+        (get project-id investor-data)
+        (get distribution-id investor-data)
+        (get investor investor-data)
+    )
+)
+
+(define-public (close-reward-pool (project-id uint))
+    (let (
+        (project-data (unwrap! (map-get? projects project-id) (err u95)))
+        (reward-pool (unwrap! (map-get? project-reward-pools project-id) (err u96)))
+    )
+        (asserts! (is-eq (get owner project-data) tx-sender) (err u97))
+        (asserts! (get active reward-pool) (err u98))
+        
+        (map-set project-reward-pools project-id 
+            (merge reward-pool {active: false})
+        )
+        (ok true)
+    )
+)
+
+(define-public (emergency-withdraw-rewards (project-id uint))
+    (let (
+        (project-data (unwrap! (map-get? projects project-id) (err u99)))
+        (reward-pool (unwrap! (map-get? project-reward-pools project-id) (err u100)))
+        (remaining-balance (- (get total-deposited reward-pool) (get total-distributed reward-pool)))
+    )
+        (asserts! (is-eq (get owner project-data) tx-sender) (err u101))
+        (asserts! (not (get active reward-pool)) (err u102))
+        (asserts! (> remaining-balance u0) (err u103))
+        
+        (try! (as-contract (stx-transfer? remaining-balance tx-sender (get owner project-data))))
+        
+        (map-set project-reward-pools project-id 
+            (merge reward-pool {
+                total-distributed: (get total-deposited reward-pool)
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-reward-pool (project-id uint))
+    (ok (map-get? project-reward-pools project-id))
+)
+
+(define-read-only (get-reward-distribution (project-id uint) (distribution-id uint))
+    (ok (map-get? reward-distributions {project-id: project-id, distribution-id: distribution-id}))
+)
+
+(define-read-only (get-investor-reward-claim (project-id uint) (distribution-id uint) (investor principal))
+    (ok (map-get? investor-reward-claims {project-id: project-id, distribution-id: distribution-id, investor: investor}))
+)
+
+(define-read-only (get-investor-total-rewards (investor principal))
+    (ok (map-get? investor-total-rewards investor))
+)
+
+(define-read-only (get-total-rewards-distributed)
+    (ok (var-get total-rewards-distributed))
+)
+
+(define-read-only (get-reward-distribution-count)
+    (ok (var-get reward-distribution-count))
+)
+
+(define-read-only (calculate-pending-rewards (project-id uint) (investor principal))
+    (let (
+        (reward-pool (unwrap! (map-get? project-reward-pools project-id) (err u104)))
+        (distribution-count (get distribution-count reward-pool))
+    )
+        (ok (fold check-pending-reward (list u0 u1 u2 u3 u4 u5 u6 u7 u8 u9) u0))
+    )
+)
+
+(define-private (check-pending-reward (distribution-id uint) (total-pending uint))
+    (let (
+        (claim-data (map-get? investor-reward-claims {project-id: u0, distribution-id: distribution-id, investor: tx-sender}))
+    )
+        (if (and (is-some claim-data) (not (get claimed (unwrap-panic claim-data))))
+            (+ total-pending (get amount (unwrap-panic claim-data)))
+            total-pending
+        )
+    )
+)
+
+(define-read-only (get-project-reward-stats (project-id uint))
+    (let (
+        (reward-pool (unwrap! (map-get? project-reward-pools project-id) (err u105)))
+        (project-data (unwrap! (map-get? projects project-id) (err u106)))
+    )
+        (ok {
+            total-deposited: (get total-deposited reward-pool),
+            total-distributed: (get total-distributed reward-pool),
+            distribution-count: (get distribution-count reward-pool),
+            total-investors: (get investors project-data),
+            reward-rate: (if (> (get raised project-data) u0)
+                (/ (* (get total-deposited reward-pool) u100) (get raised project-data))
+                u0),
+            active: (get active reward-pool)
+        })
+    )
+)
+
+
+
